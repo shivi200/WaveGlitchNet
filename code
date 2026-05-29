@@ -1,0 +1,277 @@
+"""
+WaveGlitchNet — Gravitational Wave Glitch Classification
+=========================================================
+Author: Shivika Lamba
+Affiliation: Spartificial Innovations Pvt. Ltd. (Research Internship)
+
+Classifies 22 categories of transient noise artefacts ("glitches") in LIGO
+gravitational-wave detector data using a custom Convolutional Neural Network.
+
+Dataset: GravitySpy (Kaggle)
+https://www.kaggle.com/datasets/tentotheminus9/gravity-spy-gravitational-waves
+
+Results:
+  - Test accuracy:         92%
+  - Weighted avg F1-score: 0.92
+  - Best class F1:         0.99 (Power Line, Violin Mode)
+
+Requirements:
+  tensorflow, numpy, pandas, matplotlib, seaborn, opencv-python, scikit-learn
+"""
+
+# =============================================================================
+# 1. IMPORTS
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cv2
+
+import tensorflow as tf
+from tensorflow.keras import layers, Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from sklearn.utils.class_weight import compute_class_weight
+
+# =============================================================================
+# 2. DATASET SETUP
+# =============================================================================
+# Download the dataset from Kaggle before running:
+#   kaggle datasets download -d tentotheminus9/gravity-spy-gravitational-waves
+#   unzip gravity-spy-gravitational-waves.zip
+#
+# Expected directory structure:
+#   train/train/<category>/*.png
+#   validation/validation/<category>/*.png
+#   test/test/<category>/*.png
+
+TRAIN_DIR      = '/content/train/train'
+VAL_DIR        = '/content/validation/validation'
+TEST_DIR       = '/content/test/test'
+
+IMAGE_SIZE     = (384, 384)   # resized from original 479x569 — chosen as 256+128
+                               # to balance detail retention and memory efficiency
+BATCH_SIZE     = 64           # optimal batch size after hyperparameter tuning
+NUM_EPOCHS     = 5
+
+# =============================================================================
+# 3. EXPLORE CLASS DISTRIBUTION
+# =============================================================================
+
+def count_images_per_class(root_dir):
+    """Count images per category to assess class imbalance."""
+    class_counts = {}
+    for category in sorted(os.listdir(root_dir)):
+        folder_path = os.path.join(root_dir, category)
+        if os.path.isdir(folder_path):
+            count = len([f for f in os.listdir(folder_path) if f.endswith('.png')])
+            class_counts[category] = count
+    return class_counts
+
+class_counts = count_images_per_class(TRAIN_DIR)
+
+# Plot class distribution
+plt.figure(figsize=(10, 10))
+sns.barplot(
+    x=list(class_counts.values()),
+    y=list(class_counts.keys()),
+    color='steelblue'
+)
+plt.title("Number of training images per glitch category", fontsize=14)
+plt.xlabel("Number of images")
+plt.ylabel("Glitch category")
+plt.tight_layout()
+plt.show()
+
+# The dataset is heavily imbalanced:
+# - Most represented: Blip (~5,000 images)
+# - Least represented: Paired Doves, Wandering Line, Air Compressor (~36–100 images)
+# Class weighting is used to address this (see Section 5).
+
+# =============================================================================
+# 4. DATA LOADING AND PREPROCESSING
+# =============================================================================
+
+def load_dataset(directory, image_size=IMAGE_SIZE, batch_size=BATCH_SIZE, shuffle=True):
+    """
+    Load images from a directory using TensorFlow's image_dataset_from_directory.
+    Labels are inferred from subdirectory names.
+    Images are loaded in grayscale (single channel).
+    """
+    return tf.keras.utils.image_dataset_from_directory(
+        directory,
+        labels='inferred',
+        label_mode='int',
+        color_mode='grayscale',   # single channel; shape becomes (384, 384, 1)
+        batch_size=batch_size,
+        image_size=image_size,
+        shuffle=shuffle,
+    )
+
+training_set   = load_dataset(TRAIN_DIR)
+validation_set = load_dataset(VAL_DIR)
+
+# Extract class names from the training set
+categories = training_set.class_names
+num_classes = len(categories)
+print(f"Number of glitch classes: {num_classes}")
+print(f"Classes: {categories}")
+
+
+def normalise(image, label):
+    """Normalise pixel values from [0, 255] to [0, 1]."""
+    image = tf.cast(image, tf.float32) / 255.0
+    return image, label
+
+training_set   = training_set.map(normalise)
+validation_set = validation_set.map(normalise)
+
+# =============================================================================
+# 5. CLASS WEIGHTING
+# =============================================================================
+# Addresses the class imbalance problem by assigning higher loss weight
+# to underrepresented categories during training.
+
+# Collect all labels from training set
+all_labels = np.concatenate([labels.numpy() for _, labels in training_set])
+
+class_weights_array = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(all_labels),
+    y=all_labels
+)
+class_weights = dict(enumerate(class_weights_array))
+print("Class weights computed for", len(class_weights), "categories.")
+
+# =============================================================================
+# 6. MODEL ARCHITECTURE — WaveGlitchNet
+# =============================================================================
+# A compact custom CNN selected after systematic hyperparameter search.
+#
+# Key design choices:
+#   - 5x5 kernels outperformed 3x3 for capturing broader spectrogram patterns
+#   - 2 Conv layers faster and equally accurate to 3+ layers
+#   - Dropout (0.2) prevents overfitting without sacrificing accuracy
+#   - Single Dense(128) layer balances capacity and training speed
+#   - ~70.9M total parameters — compact for 384x384 input images
+
+model = Sequential([
+    # First convolutional block
+    Conv2D(filters=32, kernel_size=(5, 5), activation='relu',
+           input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 1)),
+    MaxPooling2D(pool_size=(2, 2)),
+    Dropout(0.2),
+
+    # Second convolutional block
+    Conv2D(filters=64, kernel_size=(5, 5), activation='relu'),
+    MaxPooling2D(pool_size=(2, 2)),
+    Dropout(0.2),
+
+    # Fully connected layers
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dense(num_classes, activation='softmax')   # 22 output classes
+], name='WaveGlitchNet')
+
+model.summary()
+
+# =============================================================================
+# 7. COMPILE AND TRAIN
+# =============================================================================
+
+model.compile(
+    optimizer='adam',
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+    metrics=['accuracy']
+)
+
+# Early stopping: halt training if validation loss stops improving
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    min_delta=0.005,
+    restore_best_weights=True
+)
+
+history = model.fit(
+    training_set,
+    epochs=NUM_EPOCHS,
+    validation_data=validation_set,
+    class_weight=class_weights,
+    callbacks=[early_stopping]
+)
+
+# =============================================================================
+# 8. TRAINING CURVES
+# =============================================================================
+
+def plot_training_history(history):
+    """Plot loss and accuracy curves for training and validation sets."""
+    epochs_range = range(1, len(history.history['loss']) + 1)
+
+    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+    fig.suptitle("WaveGlitchNet Training History", fontsize=14)
+    fig.tight_layout(pad=3.0)
+
+    axs[0, 0].plot(epochs_range, history.history['loss'],         color='green')
+    axs[0, 0].set_title("Training Loss")
+
+    axs[0, 1].plot(epochs_range, history.history['accuracy'],     color='maroon')
+    axs[0, 1].set_title("Training Accuracy")
+
+    axs[1, 0].plot(epochs_range, history.history['val_loss'],     color='gray')
+    axs[1, 0].set_title("Validation Loss")
+
+    axs[1, 1].plot(epochs_range, history.history['val_accuracy'], color='black')
+    axs[1, 1].set_title("Validation Accuracy")
+
+    for ax in axs.flat:
+        ax.set_xlabel("Epoch")
+
+    plt.show()
+
+plot_training_history(history)
+
+# =============================================================================
+# 9. EVALUATION ON TEST SET
+# =============================================================================
+
+test_set = load_dataset(TEST_DIR, shuffle=False)
+test_set = test_set.map(normalise)
+
+# Generate predictions
+all_preds  = []
+all_labels = []
+
+for images, labels in test_set:
+    preds = model.predict(images, verbose=0)
+    all_preds.extend(np.argmax(preds, axis=1))
+    all_labels.extend(labels.numpy())
+
+all_preds  = np.array(all_preds)
+all_labels = np.array(all_labels)
+
+# Classification report
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+print("\nClassification Report:")
+print(classification_report(all_labels, all_preds, target_names=categories))
+
+# Confusion matrix
+cm = confusion_matrix(all_labels, all_preds)
+fig, ax = plt.subplots(figsize=(14, 12))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=categories)
+disp.plot(ax=ax, xticks_rotation='vertical', colorbar=True)
+plt.title("WaveGlitchNet — Confusion Matrix (Test Set)")
+plt.tight_layout()
+plt.show()
+
+# =============================================================================
+# 10. SAVE MODEL
+# =============================================================================
+# Save trained weights as .h5 for reuse without retraining
+
+model.save('waveglitchnet.h5')
+print("Model saved to waveglitchnet.h5")
